@@ -1,30 +1,31 @@
 # wechat-jev-android
 
 安卓版「微信一对一好友聊天实时分析助手」。基于 **LSPosed/Xposed** 在微信进程内 Hook，
-实时读取对方发来的消息，用 **TypeSafe AI 的 Jev**（System One 决策模型）分析意图/情绪/是否需回复/紧急度，
-用**本地悬浮窗**把决策结果显示出来（不发微信消息、不碰对方聊天，纯本地展示）。
+实时读取**对方发来的纯文本消息**，用 **TypeSafe AI 的 Jev**（System One 决策模型）分析
+情绪 / 意图 / 真实需求 / 潜台词 / 该不该回 / 关系危险度，然后在**对方气泡正下方本地注入一张
+仿引用小卡片**把结果显示出来——**不发任何微信消息、对方看不到、不碰聊天内容**。
 
-> ⚠️ 合规提醒：Hook 微信违反微信使用条款、有封号风险。仅限在你**自有账号 + 模拟器/测试机、自担风险**使用。
-> 本项目默认只「读 + 本地显示」，不自动回复、不发送任何消息，把风险降到最低。
+> ⚠️ 合规提醒：Hook 微信违反微信使用条款、**有封号风险**。仅限在你**自有账号、自担风险**下使用。
+> 本项目只「读 + 本地显示」，不自动回复、不发送任何消息，把风险降到最低。作者不对任何账号损失负责。
 
-## 为什么这样设计
+## 特点
 
-- **Jev 不是聊天模型**：吃「状态 + 带类型的问题」，吐「带类型的决策 + 置信度」（Choice/Noul/Score）。
-  所以悬浮窗里显示的就是决策本身（意图=提问 82% 等），不需要第二个模型生成话术。
-- **Hook TextView 而非微信混淆类**：Hook 的是 Android 框架层的 `TextView`，与微信版本无关，
-  任意微信版本都能跑，别人拿去装不用改类名——这是"给别人用"的关键。
-- **只读不发**：不调用微信任何发送接口，只在本地悬浮窗显示分析，最大限度降低封号风险。
-- **各用各的 key**：Jev API key 在 App 设置页里自己填，存本地，谁装谁填。
+- **决策模型而非聊天模型**：Jev 吃「状态 + 带类型的问题」，吐「带类型的决策 + 置信度」
+  （Choice / Noul / Score）。卡片里显示的就是决策本身（如 `情绪 😠生气65%`），不需要第二个模型生成话术。
+- **只分析对方、只分析纯文本**：靠消息行内头像位置判方向（头像在左=对方），
+  过滤掉自己发的、名字、时间戳、通话记录、红包/转账、网址/分享卡片、添加好友系统提示等；**群聊自动不生效**。
+- **情绪可叠加**：同一条消息可同时显示多种情绪及各自概率（如 `😠生气65% / 🥺委屈40%`），每个维度单独一行。
+- **各用各的 key**：Jev API key 在 App 设置页自己填，存本地、通过 ContentProvider 跨进程给微信侧读，**不入代码、不入日志**。
+- **无三方网络依赖**：`HttpURLConnection` 直连，`JevClient` 端点自动归一化到 `/v1/systemone`（官方 `api.typesafe.ai` 或自建中转站均可）。
 
 ## 数据流
 
 ```
-微信进程内 Hook TextView.setText
-  → 识别聊天气泡文本 + 方向(对方/自己) + 引用原文
-  → 只取「对方发来的」消息
-  → 组 state + typed questions，HTTPS 调 Jev /v1/systemone
-  → 拿决策 + 置信度
-  → 通过悬浮窗服务显示在屏幕上
+微信进程内 Hook 聊天页
+  → 扫描消息列表，按行内头像位置判方向，只取「对方发来的」纯文本气泡
+  → 结合 per-好友滚动上下文，组 state + typed questions
+  → HTTPS 调 Jev /v1/systemone，拿回带类型决策 + 置信度
+  → 在该气泡正下方本地注入一张仿引用卡片，逐行显示各维度结果
 ```
 
 ## 模块结构
@@ -32,37 +33,49 @@
 ```
 app/src/main/java/com/ebyte/wxjev/
   hook/WeChatHook.kt        Xposed 入口(IXposedHookLoadPackage)，只在 com.tencent.mm 生效
-  hook/MessageHooker.kt     Hook TextView，抓聊天消息 + 判方向 + 抓引用
-  hook/MsgBridge.kt         把抓到的消息发给悬浮窗服务(广播)
-  analysis/JevClient.kt     HTTPS 调 Jev /v1/systemone（HttpURLConnection，无三方依赖）
-  analysis/Questions.kt     typed questions 定义(意图/情绪/是否回复/紧急度)
+  hook/ChatInjector.kt      聊天页扫描：判方向、过滤非文本/群聊、注入结果卡片
+  hook/QuoteCardBuilder.kt  本地画仿引用小卡片（透明底、每维度一行）
+  hook/HookConfig.kt        微信侧读配置（跨进程查 ContentProvider，含缓存）
+  analysis/Analyzer.kt      分析器接口（JevClient / MockAnalyzer 两实现）
+  analysis/JevClient.kt     HTTPS 调 Jev /v1/systemone，端点归一化，无三方依赖
+  analysis/MockAnalyzer.kt  离线关键词启发式，用于无 key 时自测链路
+  analysis/Questions.kt     typed questions 定义（情绪/意图/需求/潜台词/该不该回/关系危险度）
   analysis/Decision.kt      决策数据模型 + Jev 响应归一化
-  analysis/ContextStore.kt  per-好友 滚动上下文
-  overlay/OverlayService.kt 悬浮窗服务：收到消息→分析→显示
-  config/Prefs.kt           跨进程读配置(XSharedPreferences)，存 Jev key/开关
+  analysis/DecisionRenderer.kt 决策 → 卡片文字（图标 + 概率分布）
+  analysis/ContextStore.kt  per-好友滚动上下文
+  config/ConfigProvider.kt  暴露配置给微信进程的 ContentProvider
+  config/Prefs.kt           本地配置存取（key / base_url / model / 维度开关 / mock 开关）
   ui/MainActivity.kt        激活状态 + 说明
-  ui/SettingsActivity.kt    填 Jev key、选监听好友、开关维度
+  ui/SettingsActivity.kt    填 Jev key / 接口地址 / 模型，开关维度
 ```
 
-## 构建与安装
+## 构建
 
-需要 Android SDK + JDK 17+。仓库自带 Gradle wrapper。
+需要 Android SDK + JDK 17+，仓库自带 Gradle wrapper。
 
 ```bash
-# 1) 编译 debug APK
 ./gradlew assembleDebug
 # 产物：app/build/outputs/apk/debug/app-debug.apk
-
-# 2) 装到已 root + 已装 LSPosed 的设备/模拟器
-adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-安装后：
-1. 打开 **LSPosed** → 模块 → 勾选「微信Jev助手」→ 作用域勾 **微信**（com.tencent.mm）→ 重启微信。
-2. 打开本 App → 设置页填 **Jev API key**（从 https://typesafe.ai 获取）→ 授予**悬浮窗权限**。
-3. 在微信里和好友聊天，对方发消息时屏幕上会弹出 Jev 分析悬浮窗。
+## 安装与使用
 
-## 状态
+前提：一台可用 LSPosed 环境的设备（Root + LSPosed，或用 **LSPatch** 免 Root 对微信打补丁）。
 
-骨架阶段。核心 Hook/分析/悬浮窗/设置链路已实现。真实 Hook 锚点（哪些 TextView 是聊天消息、如何判方向）
-在真机上用不同微信版本可能要微调，代码里已用启发式 + `# TODO(real):` 标注。
+1. 安装本 APK。
+2. 用 **LSPosed**（勾选模块 → 作用域勾微信 `com.tencent.mm` → 重启微信），
+   或用 **LSPatch** 对微信重新修补后安装打补丁的微信。
+3. 打开本 App → 设置页填 **Jev API key**（官方从 https://typesafe.ai 获取，或填自建中转站地址）→ 取消勾选「使用 Mock 分析」。
+4. 在微信里进一对一聊天页，对方发纯文本消息时，气泡下方会出现 Jev 分析卡片。
+
+> MIUI/HyperOS 等系统需给本 App 开「自启动 + 省电无限制」，否则微信进程可能读不到 key 而回落到 Mock。
+
+## 已知限制
+
+- 微信自绘气泡在不同版本控件结构不同，方向判断/文本抓取是启发式的，换版本可能要微调。
+- 卡片注入依赖聊天页视图结构，微信大改版后需要适配。
+- Jev 分析质量取决于模型与所填上下文；离线 Mock 仅用于验证链路，非真实分析。
+
+## 许可
+
+[MIT](LICENSE)
