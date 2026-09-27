@@ -34,10 +34,14 @@ import java.util.concurrent.Executors
 object ChatInjector {
     private const val TAG = "wxjev-inject"
     private const val CARD_TAG = "wxjev_card"
-    private const val DONE_TAG_KEY = 0x7E000001            // View.setTag(key, ...)
+    private const val WRAP_TAG = "wxjev_wrap"
+    private const val DONE_TAG_KEY = 0x7E000001            // 存"该气泡已分析的文本"(String)，用于识别复用
+    private const val LISTENER_TAG_KEY = 0x7E000002        // 标记已给消息列表挂过布局监听
+    private const val CARDTEXT_TAG_KEY = 0x7E000003        // 卡片上存"它对应的消息文本"
     private val io = Executors.newFixedThreadPool(2)
     private val store = ContextStore(20)
     private var lastScan = 0L
+    private const val THROTTLE = 500L
 
     fun install(lpparam: XC_LoadPackage.LoadPackageParam) {
         XposedHelpers.findAndHookMethod(
@@ -45,17 +49,21 @@ object ChatInjector {
             object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val ev = param.args[0] as? MotionEvent ?: return
-                    if (ev.action != MotionEvent.ACTION_UP) return
+                    // 抬手(读完/点击)与滑动(滚动看历史/新消息)都触发，覆盖"只看不点"以外的场景
+                    if (ev.action != MotionEvent.ACTION_UP && ev.action != MotionEvent.ACTION_MOVE) return
                     val act = param.thisObject as? Activity ?: return
-                    val now = System.currentTimeMillis()
-                    if (now - lastScan < 800) return
-                    lastScan = now
-                    Log.e(TAG, "touch on ${act.javaClass.name}")
-                    try { scan(act) } catch (t: Throwable) { Log.e(TAG, "scan err: ${Log.getStackTraceString(t)}") }
+                    triggerScan(act)
                 }
             }
         )
         Log.e(TAG, "注入器已装")
+    }
+
+    private fun triggerScan(act: Activity) {
+        val now = System.currentTimeMillis()
+        if (now - lastScan < THROTTLE) return
+        lastScan = now
+        try { scan(act) } catch (t: Throwable) { Log.e(TAG, "scan err: ${Log.getStackTraceString(t)}") }
     }
 
     private fun scan(act: Activity) {
@@ -69,8 +77,20 @@ object ChatInjector {
         val listRect = android.graphics.Rect()
         if (list == null || !list.getGlobalVisibleRect(listRect)) return
 
-        // 群聊不生效：群聊标题通常带成员数“群名(5)”，或聊天页顶部有形如 (数字) 的成员计数。
-        if (isGroupChat(root, sw, sh)) { Log.e(TAG, "群聊，跳过"); return }
+        // 给消息列表挂一次滚动监听：滑动/新消息导致布局变化时也重新扫描，
+        // 解决"只有点一下才触发、有时不触发"的稳定性问题。
+        if (list.getTag(LISTENER_TAG_KEY) != true) {
+            list.setTag(LISTENER_TAG_KEY, true)
+            list.viewTreeObserver.addOnScrollChangedListener {
+                (list.context as? Activity)?.let { triggerScan(it) }
+            }
+        }
+
+        // 群聊不生效：多信号判定，任一命中即视为群聊并跳过。
+        if (isGroupChat(root, list, sw, sh)) { Log.e(TAG, "群聊，跳过"); return }
+
+        // 当前聊天对象名（用标题做 per-好友上下文键，避免不同好友的历史串味）
+        val friend = currentChatTitle(root, sh) ?: "chat"
 
         val bubbles = ArrayList<Pair<View, String>>()
         // 该消息列表的直接子行，用于把候选文字归属到"行"，再靠行内头像判方向
@@ -87,8 +107,8 @@ object ChatInjector {
         }
 
         fun walk(v: View) {
-            // 跳过我们自己注入的卡片/包裹容器整棵子树
-            if (v.tag == CARD_TAG || v.tag == "wxjev_wrap") return
+            // 跳过我们自己注入的卡片子树（但要继续深入 wrap 容器，才能重新扫描被复用行里的气泡）
+            if (v.tag == CARD_TAG) return
             val cn = v.javaClass.name
             val r = android.graphics.Rect()
             if ((cn.contains("Neat") || (v is TextView && v !is android.widget.EditText)) &&
@@ -117,14 +137,25 @@ object ChatInjector {
         var injected = 0
         for ((bubble, text) in bubbles) {
             val parent = bubble.parent as? ViewGroup ?: continue
-            if (bubble.getTag(DONE_TAG_KEY) == true) continue
-            if (siblingHasCard(parent)) { bubble.setTag(DONE_TAG_KEY, true); continue }
-            bubble.setTag(DONE_TAG_KEY, true)
+            // 关键：RecyclerView 会复用行视图。用"该气泡上次分析的文本"判重，而非一次性布尔标记：
+            //  - 文本相同 => 已分析过这条，跳过；
+            //  - 文本不同（视图被复用给了新消息）=> 清掉旧卡片，重新分析。
+            val prev = bubble.getTag(DONE_TAG_KEY) as? String
+            if (prev == text) continue
+            removeStaleCards(parent)
+            bubble.setTag(DONE_TAG_KEY, text)
             Log.e(TAG, "注入->'${text.take(20)}'")
-            injectPlaceholderAndAnalyzeText(bubble, text)
+            injectPlaceholderAndAnalyzeText(bubble, text, friend)
             injected++
         }
         Log.e(TAG, "本轮注入$injected")
+    }
+
+    /** 清掉某容器内我们注入过的旧卡片（视图被复用给新消息时，旧卡片必须先移除）。 */
+    private fun removeStaleCards(parent: ViewGroup) {
+        for (i in parent.childCount - 1 downTo 0) {
+            if (parent.getChildAt(i)?.tag == CARD_TAG) parent.removeViewAt(i)
+        }
     }
 
     /** 从控件读文字：先 TextView.getText，为空则反射已发现的字段。 */
@@ -218,36 +249,100 @@ object ChatInjector {
     }
 
     /**
-     * 判断是否群聊聊天页。依据（任一命中即认为是群聊）：
-     *  1. 顶部标题区（屏幕上 12%）出现形如 "群名(5)" / "(12)" 的成员计数——单聊标题没有括号数字。
-     *  2. 顶部标题区出现明显的群相关字样。
-     *  3. 消息列表里同一屏出现 >=3 个"不同左侧头像"位置的消息行——单聊对方头像 x 恒定，
-     *     群聊不同成员头像 x 也相同（都在最左），所以主要靠 1。
-     * 保守起见：只用标题括号数字这个强信号，避免误判单聊。
+     * 判断是否群聊聊天页。多信号，任一命中即认为是群聊（宁可漏分析也不误判到群里）：
+     *  1. 顶部标题区出现 "群名(5)" / "(12)" 成员计数（单聊标题无括号数字）。
+     *  2. 顶部标题区出现群聊关键字（"群聊"、"群通知"等）。
+     *  3. 顶部出现"聊天信息(N)"之类。
+     *  4. 消息列表可见行里，"对方(左侧)消息行"用到了 >=2 个不同的头像图片位置 —— 单聊对方
+     *     头像恒定一致，群聊里不同成员头像不同。这里用"左侧头像行里出现了发送者昵称小条"近似：
+     *     群聊每条对方消息气泡上方有独立昵称 TextView（短、无标点、在头像右侧上方）。
      */
-    private fun isGroupChat(root: View, sw: Int, sh: Int): Boolean {
-        var group = false
+    private fun isGroupChat(root: View, list: ViewGroup, sw: Int, sh: Int): Boolean {
         val topLimit = sh * 0.14
-        fun walk(v: View) {
-            if (group) return
+        var titleGroup = false
+        fun walkTitle(v: View) {
+            if (titleGroup) return
             if (v is TextView && v.visibility == View.VISIBLE) {
                 val loc = IntArray(2); v.getLocationOnScreen(loc)
                 if (loc[1] in 0..topLimit.toInt()) {
                     val t = v.text?.toString()?.trim() ?: ""
-                    // 标题带成员数：结尾 "(数字)" 或 "（数字）"，如 "开发群(8)"
-                    if (Regex(""".+[(（]\d{1,4}[)）]$""").matches(t)) group = true
+                    // 标题带成员数：结尾 "(数字)" 或 "（数字）"，如 "开发群(8)"、"群聊(23)"
+                    if (Regex(""".*[(（]\d{1,4}[)）]\s*$""").matches(t)) titleGroup = true
+                    if (t.contains("群聊") || t.contains("群通知") || t.contains("群公告")) titleGroup = true
+                }
+            }
+            if (v is ViewGroup) for (i in 0 until v.childCount) walkTitle(v.getChildAt(i))
+        }
+        walkTitle(root)
+        if (titleGroup) return true
+
+        // 信号4：统计对方侧消息行里"发送者昵称小条"的出现。群聊里每条对方消息上方有独立昵称。
+        // 做法：遍历列表可见行，若某行含左侧头像(对方)，看该行头像右上方是否有一个短昵称 TextView。
+        var senderNameRows = 0
+        for (i in 0 until list.childCount) {
+            val row = list.getChildAt(i) as? ViewGroup ?: continue
+            if (isIncoming(row, sw) != true) continue
+            if (rowHasSenderName(row, sw)) senderNameRows++
+        }
+        // 有 >=1 行出现发送者昵称，基本可判群聊（单聊对方消息从不显示昵称条）
+        return senderNameRows >= 1
+    }
+
+    /**
+     * 该(对方)消息行里是否存在"发送者昵称条"：一个短(<=16字符)、无句末标点、靠近行顶部、
+     * 位于头像右侧的小 TextView。单聊没有这个条。
+     */
+    private fun rowHasSenderName(row: ViewGroup, sw: Int): Boolean {
+        val rowLoc = IntArray(2); row.getLocationOnScreen(rowLoc)
+        val rowTop = rowLoc[1]
+        var found = false
+        fun walk(v: View) {
+            if (found) return
+            if (v is TextView && v.visibility == View.VISIBLE && v !is android.widget.EditText) {
+                val t = v.text?.toString()?.trim() ?: ""
+                if (t.isNotEmpty() && t.length <= 16 && !t.contains("\n") &&
+                    !t.any { it in "。！？，,.!?~…：:；;" }) {
+                    val loc = IntArray(2); v.getLocationOnScreen(loc)
+                    // 靠近行顶部(昵称在气泡上方)、且不在最左(头像右侧)、字号小
+                    if (loc[1] - rowTop in 0..40 && loc[0] > sw * 0.12 && loc[0] < sw * 0.6) {
+                        found = true
+                    }
+                }
+            }
+            if (v is ViewGroup) for (i in 0 until v.childCount) walk(v.getChildAt(i))
+        }
+        walk(row)
+        return found
+    }
+
+    private fun containsAvatar(v: View): Boolean {
+        val cn = v.javaClass.name
+        if (cn.contains("Avatar") || cn.contains("MaskLayout")) return true
+        if (v is ViewGroup) for (i in 0 until v.childCount) if (containsAvatar(v.getChildAt(i))) return true
+        return false
+    }
+
+    /** 取顶部标题栏的聊天对象名，作为 per-好友上下文键。取屏幕上部最靠上的较短可见 TextView。 */
+    private fun currentChatTitle(root: View, sh: Int): String? {
+        val topLimit = (sh * 0.12).toInt()
+        var best: String? = null
+        var bestY = Int.MAX_VALUE
+        fun walk(v: View) {
+            if (v is TextView && v.visibility == View.VISIBLE) {
+                val loc = IntArray(2); v.getLocationOnScreen(loc)
+                if (loc[1] in 0..topLimit) {
+                    val t = v.text?.toString()?.trim() ?: ""
+                    if (t.isNotEmpty() && t.length in 1..24 && !isNoise(t) &&
+                        t !in setOf("微信", "返回", "聊天")) {
+                        if (loc[1] < bestY) { bestY = loc[1]; best = t }
+                    }
                 }
             }
             if (v is ViewGroup) for (i in 0 until v.childCount) walk(v.getChildAt(i))
         }
         walk(root)
-        return group
-    }
-
-    private fun containsAvatar(v: View): Boolean {
-        if (v.javaClass.name.contains("ChattingAvatar")) return true
-        if (v is ViewGroup) for (i in 0 until v.childCount) if (containsAvatar(v.getChildAt(i))) return true
-        return false
+        // 去掉群成员数括号（若有），并统一为好友键
+        return best?.replace(Regex("""[(（]\d{1,4}[)）]\s*$"""), "")?.trim()
     }
 
     /** 递归 dump 控件树：类名 + 文本(若有) + 坐标宽度，用于定位自绘气泡控件。 */
@@ -437,20 +532,25 @@ object ChatInjector {
     }
 
     private fun injectPlaceholderAndAnalyze(bubble: TextView, text: String) {
-        injectPlaceholderAndAnalyzeText(bubble, text)
+        injectPlaceholderAndAnalyzeText(bubble, text, "chat")
     }
 
-    private fun injectPlaceholderAndAnalyzeText(bubble: View, text: String) {
-        val parent = bubble.parent as? ViewGroup ?: return
+    private fun injectPlaceholderAndAnalyzeText(bubble: View, text: String, friend: String) {
         val ctx = bubble.context
         val card = QuoteCardBuilder.build(ctx, CARD_TAG)
+        card.setTag(CARDTEXT_TAG_KEY, text)
 
-        // 把气泡"包起来"：用一个竖向容器替换气泡本身，容器里放 [原气泡, 卡片]，
-        // 这样卡片一定在气泡正下方、且与气泡同侧（左），不会被塞到行的右边。
+        // 把卡片放到气泡正下方、同侧（左）。两种情况：
+        //  A) 气泡已在我们之前建的 wrap 里（视图被复用）：直接把新卡片加到 wrap 末尾，不再套娃。
+        //  B) 首次：用一个竖向 wrap 替换气泡，wrap 里放 [原气泡, 卡片]。
         bubble.post {
             try {
                 val p = bubble.parent as? ViewGroup ?: return@post
                 if (siblingHasCard(p)) return@post
+                if (p.tag == WRAP_TAG) {
+                    p.addView(card)
+                    return@post
+                }
                 val idx = p.indexOfChild(bubble)
                 if (idx < 0) return@post
                 val lp = bubble.layoutParams
@@ -458,7 +558,7 @@ object ChatInjector {
                 val wrap = LinearLayout(ctx).apply {
                     orientation = LinearLayout.VERTICAL
                     layoutParams = lp
-                    tag = "wxjev_wrap"
+                    tag = WRAP_TAG
                 }
                 bubble.layoutParams = LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
@@ -469,10 +569,10 @@ object ChatInjector {
             } catch (t: Throwable) { Log.e(TAG, "wrap err: $t") }
         }
 
-        val msg = IncomingMessage("chat", text, null, null)
+        val msg = IncomingMessage(friend, text, null, null)
         store.add(msg)
         val specs = Questions.enabled(HookConfig.dimensionsList())
-        val context = store.renderContext("chat", excludeLast = true)
+        val context = store.renderContext(friend, excludeLast = true)
         val mock = HookConfig.mock()
         val key = HookConfig.apiKey()
         val base = HookConfig.baseUrl()

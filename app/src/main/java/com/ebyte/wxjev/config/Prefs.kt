@@ -21,7 +21,8 @@ object Prefs {
     const val KEY_MOCK = "mock_analyzer"              // true=用 mock 分析器(无需 key)
     const val KEY_BASE_URL = "jev_base_url"           // Jev/中转站 base，可带或不带 /v1
 
-    val DEFAULT_DIMENSIONS = listOf("intent", "sentiment", "needs_reply", "urgency")
+    // 必须与 Questions.DEFAULT 一致，否则 Hook 侧按名字取不到题目 → 只剩个别维度
+    val DEFAULT_DIMENSIONS = listOf("emotion", "intent", "needs", "subtext", "reply", "danger")
     const val DEFAULT_BASE_URL = "https://api.typesafe.ai"
 
     // ---- App 进程写侧 ----
