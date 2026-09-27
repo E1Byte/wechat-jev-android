@@ -9,6 +9,7 @@ import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.TextView
 import com.ebyte.wxjev.analysis.ContextStore
+import com.ebyte.wxjev.analysis.ChatHistoryStore
 import com.ebyte.wxjev.analysis.IncomingMessage
 import com.ebyte.wxjev.analysis.JevClient
 import com.ebyte.wxjev.analysis.MockAnalyzer
@@ -40,8 +41,19 @@ object ChatInjector {
     private const val CARDTEXT_TAG_KEY = 0x7E000003        // 卡片上存"它对应的消息文本"
     private val io = Executors.newFixedThreadPool(2)
     private val store = ContextStore(20)
+    @Volatile private var history: ChatHistoryStore? = null
     private var lastScan = 0L
     private const val THROTTLE = 500L
+
+    /** 懒初始化 per-好友持久库（用微信 applicationContext，库落微信数据目录，跨重启有效）。 */
+    private fun history(v: View): ChatHistoryStore? {
+        history?.let { return it }
+        return try {
+            synchronized(this) {
+                history ?: ChatHistoryStore(v.context.applicationContext).also { history = it }
+            }
+        } catch (t: Throwable) { Log.e(TAG, "建库失败: $t"); null }
+    }
 
     fun install(lpparam: XC_LoadPackage.LoadPackageParam) {
         XposedHelpers.findAndHookMethod(
@@ -613,21 +625,36 @@ object ChatInjector {
         }
 
         val msg = IncomingMessage(friend, text, null, null)
-        store.add(msg)
+        val db = history(bubble)
         val specs = Questions.enabled(HookConfig.dimensionsList())
-        val context = store.renderContext(friend, excludeLast = true)
+        // 上下文优先取持久库（跨重启的完整历史，此时还未含当前这条）；取不到再退回内存
+        val context = db?.context(friend, 20)?.ifBlank { null }
+            ?: store.also { it.add(msg) }.renderContext(friend, excludeLast = true)
+        // 拼完上下文再把当前这条入库（供后续消息用）
+        db?.addMessage(friend, text)
         val mock = HookConfig.mock()
         val key = HookConfig.apiKey()
         val base = HookConfig.baseUrl()
         val model = HookConfig.model()
 
         io.execute {
+            // ① 先查缓存：这条消息之前分析过就直接用，不再调 Jev（省请求、重开秒显）
+            val cached = db?.cachedResult(friend, msg)
+            if (cached != null) {
+                Log.e(TAG, "命中缓存 friend=$friend '${text.take(16)}'")
+                card.post { QuoteCardBuilder.render(card, cached) }
+                return@execute
+            }
             val useMock = mock || key.isBlank()
             Log.e(TAG, "分析 mock=$useMock base=$base model=$model key=${if(key.isBlank())"空" else "有"}")
             val analyzer = if (useMock) MockAnalyzer() else JevClient(key, model, base)
             val result = analyzer.analyze(msg, context, specs)
             if (result.error != null) Log.e(TAG, "分析结果 err=${result.error}")
-            else Log.e(TAG, "分析结果 " + result.decisions.entries.joinToString(",") { "${it.key}=${it.value.value}" })
+            else {
+                Log.e(TAG, "分析结果 " + result.decisions.entries.joinToString(",") { "${it.key}=${it.value.value}" })
+                // ② 成功结果落库缓存（mock 结果不缓存，避免把假分析固化）
+                if (!useMock) db?.saveResult(friend, text, result)
+            }
             card.post { QuoteCardBuilder.render(card, result) }
         }
     }
