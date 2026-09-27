@@ -106,6 +106,12 @@ object ChatInjector {
             return null
         }
 
+        // 每行只保留"最主要的一段文字"（面积最大者）。这样：
+        //  - 引用回复里的【被引原文小条】被丢弃，只分析对方这次真正说的话；
+        //  - 名字条、时间等小文字不会各自成为一张卡片。
+        data class Cand(val view: View, val text: String, val area: Int)
+        val perRow = HashMap<View, Cand>()
+
         fun walk(v: View) {
             // 跳过我们自己注入的卡片子树（但要继续深入 wrap 容器，才能重新扫描被复用行里的气泡）
             if (v.tag == CARD_TAG) return
@@ -122,10 +128,15 @@ object ChatInjector {
                     // 找不到行/头像的（时间戳、系统提示、群发送者名条）一律跳过 => 不再分析名字/自己/系统。
                     val incoming = row?.let { isIncoming(it, sw) }
                     // 双保险：文字本身也必须整体在左半（排除自己右侧气泡）
-                    if (incoming == true && left < sw * 0.42) {
+                    if (row != null && incoming == true && left < sw * 0.42) {
                         val txt = if (v is TextView) v.text?.toString()?.trim() else reflectText(v)
                         if (!txt.isNullOrEmpty() && !isNoise(txt) && txt.length <= 2000 && !isLikelyName(txt)) {
-                            bubbles.add(v to txt)
+                            // 该行若是媒体/链接/位置卡片（含缩略图），整行跳过，不分析其标题文字
+                            if (!rowLooksLikeCard(row, sw)) {
+                                val area = v.width * v.height
+                                val prev = perRow[row]
+                                if (prev == null || area > prev.area) perRow[row] = Cand(v, txt, area)
+                            }
                         }
                     }
                 }
@@ -133,6 +144,7 @@ object ChatInjector {
             if (v is ViewGroup) for (i in 0 until v.childCount) walk(v.getChildAt(i))
         }
         walk(root)
+        for (c in perRow.values) bubbles.add(c.view to c.text)
         Log.e(TAG, "对方气泡候选=${bubbles.size}")
         var injected = 0
         for ((bubble, text) in bubbles) {
@@ -321,6 +333,37 @@ object ChatInjector {
         if (v is ViewGroup) for (i in 0 until v.childCount) if (containsAvatar(v.getChildAt(i))) return true
         return false
     }
+
+    /**
+     * 该(对方)消息行是否是"卡片类"消息（链接/公众号文章/小程序/位置/名片/视频号等），
+     * 这类共同特征：气泡区域内有一张明显的缩略图 ImageView（非头像、有一定尺寸）。
+     * 命中则整行跳过——解决"对方分享的地址/链接标题被当文字分析"。
+     * 判据：行内存在一个 ImageView，宽高都 >= 40dp、且不在最左（排除头像），面积够大。
+     */
+    private fun rowLooksLikeCard(row: ViewGroup, sw: Int): Boolean {
+        val minSide = dpPx(row, 36)
+        var hit = false
+        fun walk(v: View) {
+            if (hit) return
+            val cn = v.javaClass.name
+            // 头像本身跳过（它也是 ImageView/MaskLayout，但在最左且我们靠它判方向）
+            val isAvatar = cn.contains("Avatar") || cn.contains("MaskLayout")
+            if (!isAvatar && v is android.widget.ImageView && v.visibility == View.VISIBLE) {
+                val r = android.graphics.Rect()
+                if (v.getGlobalVisibleRect(r) && v.width >= minSide && v.height >= minSide) {
+                    val loc = IntArray(2); v.getLocationOnScreen(loc)
+                    // 不在最左头像区（x > 12% 屏宽），基本就是卡片缩略图/大图
+                    if (loc[0] > sw * 0.12) hit = true
+                }
+            }
+            if (v is ViewGroup) for (i in 0 until v.childCount) walk(v.getChildAt(i))
+        }
+        walk(row)
+        return hit
+    }
+
+    private fun dpPx(v: View, d: Int): Int =
+        (d * v.resources.displayMetrics.density).toInt()
 
     /** 取顶部标题栏的聊天对象名，作为 per-好友上下文键。取屏幕上部最靠上的较短可见 TextView。 */
     private fun currentChatTitle(root: View, sh: Int): String? {
