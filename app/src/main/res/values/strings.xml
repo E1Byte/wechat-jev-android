@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">微信Jev助手</string>
+    <string name="xposed_desc">实时分析对方微信消息(意图/情绪/是否需回复/紧急度)，本地悬浮窗显示。需作用于微信。</string>
+</resources>

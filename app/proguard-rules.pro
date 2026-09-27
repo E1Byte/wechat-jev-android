@@ -1,0 +1,2 @@
+-keep class com.ebyte.wxjev.hook.** { *; }
+-keepclassmembers class * { @de.robv.android.xposed.* *; }

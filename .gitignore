@@ -1,0 +1,12 @@
+.gradle/
+build/
+*.iml
+.idea/
+local.properties
+*.apk
+*.keystore
+captures/
+.externalNativeBuild/
+.cxx/
+
+# build outputs already covered by build/

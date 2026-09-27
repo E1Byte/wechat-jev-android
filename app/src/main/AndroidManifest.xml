@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application
+        android:allowBackup="true"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Material3.DayNight">
+
+        <!-- Xposed 模块声明 -->
+        <meta-data
+            android:name="xposedmodule"
+            android:value="true" />
+        <meta-data
+            android:name="xposeddescription"
+            android:value="@string/xposed_desc" />
+        <meta-data
+            android:name="xposedminversion"
+            android:value="82" />
+        <!-- 允许模块进程读取本 App 写入的偏好（Jev key 等） -->
+        <meta-data
+            android:name="xposedsharedprefs"
+            android:value="true" />
+
+        <activity
+            android:name=".ui.MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".ui.SettingsActivity"
+            android:exported="false" />
+
+        <!-- 跨进程配置通道：微信进程的 Hook 通过它读取 key/接口/维度（SELinux 允许的 app 间 IPC） -->
+        <provider
+            android:name=".config.ConfigProvider"
+            android:authorities="com.ebyte.wxjev.config"
+            android:exported="true"
+            android:grantUriPermissions="true" />
+
+    </application>
+</manifest>
